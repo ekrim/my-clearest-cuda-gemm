@@ -89,8 +89,6 @@ __global__ void gemmKernel(
 
 
 	/* Step 2: Prepare shared memory tiles of A and B
-	 *
-	 * Shmem usage strategy:
 	 * Store an A tile transposed: As[BK][BM]
 	 *   So each thread will want a len-TM row segment of As for its outer prod (that slides down BK)
 	 * Store a B tile as is: Bs[BK][BN]
@@ -147,11 +145,16 @@ __global__ void gemmKernel(
         }
     }
 
-	// Step 7: Each thread stores its 8x8 output tile starting at (global_row, global_col)
+	// Step 6: Each thread stores its 8x8 output tile starting at (global_row, global_col)
 	#pragma unroll
 	for (int i = 0; i < TM; ++i) {
-		uint4* out_vec = reinterpret_cast<uint4*>(&C[global_row * N + global_col]);
-		uint4 accRow = reinterpret_cast<const uint4*>(&acc[i][0])[0];
-		out_vec[i * (N / 8)] = row_data;
+	    __half h[TN];
+	    #pragma unroll
+	    for (int j = 0; j < TN; ++j) {
+	        h[j] = __float2half(acc[i][j]);
+	    }
+		uint4 *Cvec = reinterpret_cast<uint4*>(&C[global_row * N + global_col]);
+		uint4 accRow = reinterpret_cast<const uint4*>(h)[0];
+		Cvec[i * (N / 8)] = accRow;
 	}
 }
