@@ -134,17 +134,6 @@ __global__ void gemmKernel(
 		__syncthreads(); // sync before next tile
 	}
 
-	// Step 6: Load out to global memory in C
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        int r = row0 + i;
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            int c = col0 + j;
-            C[r * N + c] = __float2half(acc[i][j]);
-        }
-    }
-
 	// Step 6: Each thread stores its 8x8 output tile starting at (global_row, global_col)
 	#pragma unroll
 	for (int i = 0; i < TM; ++i) {
