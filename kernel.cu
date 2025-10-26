@@ -8,38 +8,33 @@ constexpr int BN = 128;
 constexpr int TM = 8;
 constexpr int TN = 8;
 // vectorized loads/stores
-constexpr int numElemPerLoad = sizeof(uint4)/sizeof(__half); // =8 (load 16B worth of 2B __half's)
+constexpr int numElemPerLoad = sizeof(uint4) / sizeof(__half); // =8 (load 16B worth of 2B __half's)
 static_assert(numElemPerLoad == TN, "If we change register tile, a vectorized store does not perfectly cover a row of the tile");
 
-template <int NumRows, int NumCols, bool IsTransposed>
+template <int NumRowsInTile, int NumColsInTile, bool IsTransposed>
 __device__ __forceinline__ void loadGlobalToShared(
-	const __half *__restrict__ X,
-	__half *__restrict__ Xs)
+	const __half *__restrict__ X, __half *__restrict__ Xs,
+	int numColsGlobal, int rowGlobBase, int colGlobBase)
 {
-	constexpr int numVecLoads = (NumRows * NumCols) / numElemPerLoad;
-
-	const int rowGlobStart = blockIdx.y * blockDim.y;
-	const int colGlobStart = blockIdx.x * blockDim.x;
-
+	constexpr int numVecLoads = (NumRowsInTile * NumColsInTile) / numElemPerLoad;
 	const int threadID = threadIdx.y * blockDim.x + threadIdx.x;
 	for (int i = threadID; i < numVecLoads; i += blockDim.x * blockDim.y) {
-		// compute where we are in the block by linear index -> block row/col -> glob row/col -> linear global
-	    const int linearIdxInBlock = i * numElemPerLoad;
-	    const int rowInBlock = linearIdxInBlock / NumCols;
-	    const int colInBlock = linearIdxInBlock % NumCols;
+		// compute where we are in the tile by linear index -> tile row/col -> glob row/col -> linear global
+	    const int linearIdxInTile = i * numElemPerLoad;
+	    const int rowInTile = linearIdxInTile / NumColsInTile;
+	    const int colInTile = linearIdxInTile % NumColsInTile;
 
-	    const int rowGlob = rowGlobStart + rowInBlock;
-	    const int colGlob = colGlobStart + colInBlock;
+	    const int rowGlob = rowGlobBase + rowInTile;
+	    const int colGlob = colGlobBase + colInTile;
 
-	    const int linearIdxGlob = rowGlob * NumCols + colGlob; // X is row-major
+	    const int linearIdxGlob = rowGlob * numColsGlobal + colGlob; // X is row-major
 	    const uint4 data = reinterpret_cast<const uint4*>(&X[linearIdxGlob])[0]; // 16B read to register
 
 	    // store to shmem, transpose if needed
 	    if constexpr (IsTransposed) {
-			__half* dataAsHalf = reinterpret_cast<__half*>(&data);
-
 			// non-vectorized store since we're storing contiguous chunk
 			// See "Design Note: Bank Conflcits" in README.md
+			__half* dataAsHalf = reinterpret_cast<__half*>(&data);
 			#pragma unroll
 			for (int j = 0; j < numElemPerLoad; ++j) {
 			    Xs[colInBlock + j][rowInBlock] = dataAsHalf[j];
@@ -51,11 +46,13 @@ __device__ __forceinline__ void loadGlobalToShared(
 	}
 }
 
-__device__ __forceinline__ void load8_from_smem(const __half* smem_base, int row, int col, __half (&h)[8])
+template <int NumColsInTile, int NumReg> // both As ans Bs have a 
+__device__ __forceinline__ void loadSharedToRegisters(
+	const __half (&Xs)[BK][NumColsInTile], __half (&h)[NumReg], )
 {
     // Shared memory is 2-byte aligned per __half
     // To vector load 8 halfs (16 bytes), reinterpret pointer to uint4
-    const uint4* vec_ptr = reinterpret_cast<const uint4*>(&smem_base[row * 128 + col]);
+    const uint4* vec_ptr = reinterpret_cast<const uint4*>(&Xs[row * 128 + col]);
     uint4 vec = *vec_ptr;
 
     // Reinterpret as 8 halfs
@@ -98,17 +95,20 @@ __global__ void gemmKernel(
 	 * For details about As vs Bs being transposed, see "Design Note: Bank Conflcits" in README.md
 	 */
 	 // TODO: padding?
-	 // TODO: idxKtile in loadGlobal
 	constexpr int padding = 
 	__shared__ __align__(16) __half As[BK][BM];
 	__shared__ __align__(16) __half Bs[BK][BN];
 
+	// row and column upper left corner of this block
+	const int rowGlobBase = blockIdx.y * blockDim.y;
+	const int colGlobBase = blockIdx.x * blockDim.x;
+
 	// Main outer loop moves the tiles across the common K dimension in BK strides 
-	for (int idxKTile = 0; idxKTile < K; idxKTile += BK) {
+	for (int idxKGlob = 0; idxKGlob < K; idxKGlob += BK) {
 
 		// Step 3: Load into shmem from global
-		loadGlobalToShared<True, BM, BK>(A, As);
-		loadGlobalToShared<False, BK, BN>(B, Bs);
+		loadGlobalToShared<True, BM, BK>(A, As, K, rowGlobBase, colGlobBase + idxKGlob);
+		loadGlobalToShared<False, BK, BN>(B, Bs, N, rowGlobBase + idxKGlob, colGlobBase);
 		__syncthreads(); // sync before trying to compute with these
 
 		// Inner loop over the K dim of just the block
@@ -117,9 +117,9 @@ __global__ void gemmKernel(
         for (int idxKBlock = 0; idxKBlock < BK; ++idxKBlock) {
 			// Step 4: Load into registers from shmem
             float Areg[TM];
-			loadSharedToRegisters()
+			loadSharedToRegisters<BM, TM>(As, Areg);
             float Breg[TN];
-			loadSharedToRegisters()
+			loadSharedToRegisters<BN, TN>(Bs, Breg);
 
 			// Step 5: Compute outer product
             // FMA into 8x8 fp32 accumulators
