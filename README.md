@@ -18,6 +18,6 @@ And we don't worry about features like:
 
 Future TODO: Take this same GEMM, but do it with CuTe layouts.
 
-### Design note: Bank Conflicts
+### Design Note: Bank Conflicts
 
 Each thread block works on a tile of `A` and `B` stored in shared memory. 

@@ -14,53 +14,49 @@ static_assert(numElemPerLoad == TN, "If we change register tile, a vectorized st
 template <int NumRowsInTile, int NumColsInTile, bool IsTransposed>
 __device__ __forceinline__ void loadGlobalToShared(
 	const __half *__restrict__ X, __half *__restrict__ Xs,
-	int numColsGlobal, int rowGlobBase, int colGlobBase)
+	int numColsGlob, int rowGlobTile, int colGlobTile)
 {
 	constexpr int numVecLoads = (NumRowsInTile * NumColsInTile) / numElemPerLoad;
 	const int threadID = threadIdx.y * blockDim.x + threadIdx.x;
 	for (int i = threadID; i < numVecLoads; i += blockDim.x * blockDim.y) {
 		// compute where we are in the tile by linear index -> tile row/col -> glob row/col -> linear global
-	    const int linearIdxInTile = i * numElemPerLoad;
-	    const int rowInTile = linearIdxInTile / NumColsInTile;
-	    const int colInTile = linearIdxInTile % NumColsInTile;
+	    const int idxInTile = i * numElemPerLoad;  
+		const int rowInTile = idxInTile / NumColsInTile;
+	    const int colInTile = idxInTile % NumColsInTile;
 
-	    const int rowGlob = rowGlobBase + rowInTile;
-	    const int colGlob = colGlobBase + colInTile;
-
-	    const int linearIdxGlob = rowGlob * numColsGlobal + colGlob; // X is row-major
-	    const uint4 data = reinterpret_cast<const uint4*>(&X[linearIdxGlob])[0]; // 16B read to register
+		const int rowGlob = rowGlobTile + rowInTile;
+		const int colGlob = colGlobTile + colInTile;
+	    const int idxGlob = rowGlob * numColsGlob + colGlob; // X is row-major
+	    const uint4 data = *reinterpret_cast<const uint4*>(&X[idxGlob]); // 16B read to register
 
 	    // store to shmem, transpose if needed
 	    if constexpr (IsTransposed) {
-			// non-vectorized store since we're storing contiguous chunk
-			// See "Design Note: Bank Conflcits" in README.md
+			// non-vectorized store since we're storing contiguous chunk as column in shmem
+			// See "Design Note: Bank Conflicts" in README.md
 			__half* dataAsHalf = reinterpret_cast<__half*>(&data);
 			#pragma unroll
 			for (int j = 0; j < numElemPerLoad; ++j) {
-			    Xs[colInBlock + j][rowInBlock] = dataAsHalf[j];
+			    Xs[colInTile + j][rowInTile] = dataAsHalf[j];
 			}
 	    } else {
-	    	// vectorized store if we're taking 16B contiguous from global and putting them contiguous in shmem
-		    reinterpret_cast<uint4*>(&Xs[rowInBlock][colInBlock])[0] = data;
+	    	// vectorized store if we're taking 16B contiguous from global and putting them contiguously into shmem
+		    reinterpret_cast<uint4*>(&Xs[rowInTile][colInTile]) = *data;
 	    }
 	}
 }
 
-template <int NumColsInTile, int NumReg> // both As ans Bs have a 
-__device__ __forceinline__ void loadSharedToRegisters(
-	const __half (&Xs)[BK][NumColsInTile], __half (&h)[NumReg], )
+template <int NumReg>
+__device__ __forceinline__ void loadSharedToRegisters(const __half *__restrict__ Xs, __half (&reg)[NumReg], int idxInTile)
 {
-    // Shared memory is 2-byte aligned per __half
-    // To vector load 8 halfs (16 bytes), reinterpret pointer to uint4
-    const uint4* vec_ptr = reinterpret_cast<const uint4*>(&Xs[row * 128 + col]);
-    uint4 vec = *vec_ptr;
+	// vectorized load from shmem
+    const uint4 data = *reinterpret_cast<const uint4*>(&Xs[idxInTile]);
 
-    // Reinterpret as 8 halfs
-    __half* temp = reinterpret_cast<__half*>(&vec);
+    // reinterpret as 8 halfs
+    const __half* dataAsHalf = reinterpret_cast<__half*>(&data);
 
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        h[i] = temp[i];
+        reg[i] = dataAsHalf[i];
     }
 }
 
@@ -75,15 +71,15 @@ __global__ void gemmKernel(
 	 *     Ctile += outerProd(A[r:r+8][ik], B[ik][c:c+8])
 	 */ 
 	float acc[TM][TN]; // results accumulate in fp32 as we iterate across the K dimension
-	// this is 8*8*4B = 256B of register usage for the thread
 
 	// zero init
     #pragma unroll
-    for (int i = 0; i < Tm; ++i)
-    #pragma unroll
-    for (int j = 0; j < Tn; ++j)
-        acc[i][j] = 0.0f;
-
+    for (int i = 0; i < TM; ++i) {
+	    #pragma unroll
+	    for (int j = 0; j < TN; ++j) {
+	        acc[i][j] = 0.f;
+	    }
+    }
 
 	/* Step 2: Prepare shared memory tiles of A and B
 	 * Store an A tile transposed: As[BK][BM]
@@ -95,31 +91,39 @@ __global__ void gemmKernel(
 	 * For details about As vs Bs being transposed, see "Design Note: Bank Conflcits" in README.md
 	 */
 	 // TODO: padding?
-	constexpr int padding = 
-	__shared__ __align__(16) __half As[BK][BM];
-	__shared__ __align__(16) __half Bs[BK][BN];
+	__shared__ alignas(16) __half As[BK][BM];
+	__shared__ alignas(16) __half Bs[BK][BN];
 
-	// row and column upper left corner of this block
-	const int rowGlobBase = blockIdx.y * blockDim.y;
-	const int colGlobBase = blockIdx.x * blockDim.x;
+	// row and column (upper left origin) of this block in output mat
+	const int rowGlobBlock = blockIdx.y * blockDim.y;
+	const int colGlobBlock = blockIdx.x * blockDim.x;
 
 	// Main outer loop moves the tiles across the common K dimension in BK strides 
-	for (int idxKGlob = 0; idxKGlob < K; idxKGlob += BK) {
+	for (int kGlobTile = 0; kGlobTile < K; kGlobTile += BK) {
 
 		// Step 3: Load into shmem from global
-		loadGlobalToShared<True, BM, BK>(A, As, K, rowGlobBase, colGlobBase + idxKGlob);
-		loadGlobalToShared<False, BK, BN>(B, Bs, N, rowGlobBase + idxKGlob, colGlobBase);
+		loadGlobalToShared<True, BM, BK>(A, As, K, rowGlobBlock, colGlobBlock + kGlobTile); // tiles slide across A cols
+		loadGlobalToShared<False, BK, BN>(B, Bs, N, rowGlobBlock + kGlobTile, colGlobBlock); // tiles slide down B rows
 		__syncthreads(); // sync before trying to compute with these
 
-		// Inner loop over the K dim of just the block
+		// Inner loop over the K dim of the tile
 		// (each thread loads to registers and computes outer product)
         #pragma unroll
-        for (int idxKBlock = 0; idxKBlock < BK; ++idxKBlock) {
+        for (int kInTile = 0; kInTile < BK; ++kInTile) {
 			// Step 4: Load into registers from shmem
+            // this block computes BMxBN output, but since we already loaded As[BK][BM] and Bs[BK][BN],
+            // we just need tile-relative indices. For register-tile at [r][c] (relative to block-tile), we
+            // take As[kInTile][r:r+TM] and Bs[kInTile][c:c+TN]
             float Areg[TM];
-			loadSharedToRegisters<BM, TM>(As, Areg);
+			const int rowInTileOfReg = threadIdx.y * TM;
+			// Asmem is transposed, so to take a len-TM row segment, this thread's row acts like the col in the index calc below
+			const int idxInTileAs = (kInTile * BM) + rowInTileOfReg;
+			loadSharedToRegisters<TM>(As, Areg, idxInTileAs);
+
             float Breg[TN];
-			loadSharedToRegisters<BN, TN>(Bs, Breg);
+			const int colInTileOfReg = threadIdx.x * TN;
+			const int idxInTileBs = (kInTile * BN) + colInTileOfReg;
+			loadSharedToRegisters<TN>(Bs, Breg, idxInTileBs);
 
 			// Step 5: Compute outer product
             // FMA into 8x8 fp32 accumulators
@@ -127,23 +131,26 @@ __global__ void gemmKernel(
             for (int i = 0; i < TM; ++i) {
                 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
-					acc[i][j] += Areg[i] * Breg[j];
+					acc[i][j] += Areg[i] * Breg[j]; // accumulate outer product for this BK-tile
 		        }
             }
         }
 		__syncthreads(); // sync before next tile
 	}
 
-	// Step 6: Each thread stores its 8x8 output tile starting at (global_row, global_col)
+	// Step 6: Store to global, this thread's TMxTN register tile
+	// row and col (upper left origin) of the register tile
+	const int rowGlobReg = rowGlobBlock + (threadIdx.y * TM);
+	const int colGlobReg = colGlobBlock + (threadIdx.x * TN);
+
 	#pragma unroll
 	for (int i = 0; i < TM; ++i) {
-	    __half h[TN];
+	    __half alignas(16) row[TN];
 	    #pragma unroll
 	    for (int j = 0; j < TN; ++j) {
-	        h[j] = __float2half(acc[i][j]);
+	        row[j] = __float2half(acc[i][j]);
 	    }
-		uint4 *Cvec = reinterpret_cast<uint4*>(&C[global_row * N + global_col]);
-		uint4 accRow = reinterpret_cast<const uint4*>(h)[0];
-		Cvec[i * (N / 8)] = accRow;
+		uint4 *dst = reinterpret_cast<uint4*>(&C[(rowGlobReg + i) * N + colGlobReg]);
+		*dst = *reinterpret_cast<const uint4*>(row);
 	}
 }
