@@ -8,19 +8,26 @@ constexpr int BN = 128;
 constexpr int TM = 8;
 constexpr int TN = 8;
 // vectorized loads/stores
-constexpr int numElemPerLoad = sizeof(uint4) / sizeof(__half); // =8 (load 16B worth of 2B __half's)
-static_assert(numElemPerLoad == TN, "If we change register tile, a vectorized store does not perfectly cover a row of the tile");
+constexpr int ONE_BANK_PADDING = 4 / sizeof(__half); // 4B/bank
+constexpr int NUM_ELEM_PER_32BANKS = 32 * ONE_BANK_PADDING;
+constexpr int NUM_ELEM_PER_LOAD = sizeof(uint4) / sizeof(__half); // =8 (load 16B worth of 2B __half's)
+static_assert(NUM_ELEM_PER_LOAD == TN, "If we change register tile, a vectorized store does not perfectly cover a row of the tile");
+
+static __device__ __forceinline__ int addPaddingToCol(int colWithoutPadding)
+{
+	return colWithoutPadding + ONE_BANK_PADDING * (colWithoutPadding / NUM_ELEM_PER_32BANKS);
+}
 
 template <int NumRowsInTile, int NumColsInTile, bool IsTransposed>
 __device__ __forceinline__ void loadGlobalToShared(
 	const __half *__restrict__ X, __half *__restrict__ Xs,
 	int numColsGlob, int rowGlobTile, int colGlobTile)
 {
-	constexpr int numVecLoads = (NumRowsInTile * NumColsInTile) / numElemPerLoad;
+	constexpr int numVecLoads = (NumRowsInTile * NumColsInTile) / NUM_ELEM_PER_LOAD;
 	const int threadID = threadIdx.y * blockDim.x + threadIdx.x;
 	for (int i = threadID; i < numVecLoads; i += blockDim.x * blockDim.y) {
 		// compute where we are in the tile by linear index -> tile row/col -> glob row/col -> linear global
-	    const int idxInTile = i * numElemPerLoad;  
+	    const int idxInTile = i * NUM_ELEM_PER_LOAD;  
 		const int rowInTile = idxInTile / NumColsInTile;
 	    const int colInTile = idxInTile % NumColsInTile;
 
@@ -35,12 +42,12 @@ __device__ __forceinline__ void loadGlobalToShared(
 			// See "Design Note: Bank Conflicts" in README.md
 			__half* dataAsHalf = reinterpret_cast<__half*>(&data);
 			#pragma unroll
-			for (int j = 0; j < numElemPerLoad; ++j) {
-			    Xs[colInTile + j][rowInTile] = dataAsHalf[j];
+			for (int j = 0; j < NUM_ELEM_PER_LOAD; ++j) {
+			    Xs[colInTile + j][addPaddingToCol(rowInTile)] = dataAsHalf[j];
 			}
 	    } else {
 	    	// vectorized store if we're taking 16B contiguous from global and putting them contiguously into shmem
-		    reinterpret_cast<uint4*>(&Xs[rowInTile][colInTile]) = *data;
+		    reinterpret_cast<uint4*>(&Xs[rowInTile][addPaddingToCol(colInTile)]) = *data;
 	    }
 	}
 }
@@ -88,11 +95,13 @@ __global__ void gemmKernel(
 	 *   Each thread still wants a row segment, len-TN, for the outer product.
 	 *
 	 * We want to read rows from shmem so data is contiguous and can use vectorized loads.
-	 * For details about As vs Bs being transposed, see "Design Note: Bank Conflcits" in README.md
+	 * For details about As vs Bs being transposed and about padding see "Design Note: Bank Conflcits" in README.md
 	 */
-	 // TODO: padding?
-	__shared__ alignas(16) __half As[BK][BM];
-	__shared__ alignas(16) __half Bs[BK][BN];
+	// BM=BN=128 __halfs/row = 64 banks/row
+	// put 1 bank's worth of padding after every 64 elements, so for each of the 4 subops of the v4 load
+	// every thread in the warp is using a different bank
+	__shared__ alignas(16) __half As[BK][BM + 2 * ONE_BANK_PADDING];
+	__shared__ alignas(16) __half Bs[BK][BN + 2 * ONE_BANK_PADDING];
 
 	// row and column (upper left origin) of this block in output mat
 	const int rowGlobBlock = blockIdx.y * blockDim.y;
@@ -117,12 +126,12 @@ __global__ void gemmKernel(
             float Areg[TM];
 			const int rowInTileOfReg = threadIdx.y * TM;
 			// Asmem is transposed, so to take a len-TM row segment, this thread's row acts like the col in the index calc below
-			const int idxInTileAs = (kInTile * BM) + rowInTileOfReg;
+			const int idxInTileAs = (kInTile * BM) + addPaddingToCol(rowInTileOfReg);
 			loadSharedToRegisters<TM>(As, Areg, idxInTileAs);
 
             float Breg[TN];
 			const int colInTileOfReg = threadIdx.x * TN;
-			const int idxInTileBs = (kInTile * BN) + colInTileOfReg;
+			const int idxInTileBs = (kInTile * BN) + addPaddingToCol(colInTileOfReg);
 			loadSharedToRegisters<TN>(Bs, Breg, idxInTileBs);
 
 			// Step 5: Compute outer product
