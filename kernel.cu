@@ -40,7 +40,7 @@ __device__ __forceinline__ void loadGlobalToShared(
 	    constexpr bool kIsTransposed = RowsSmem != RowsInputTile; // no padded rows, so we can use this check
 	    if constexpr (kIsTransposed) {
 			// non-vectorized store since we're storing contiguous chunk as column in shmem
-			// See "Design Note: Bank Conflicts" in README.md
+			// See "Design Note: Memory" in README.md
 			__half* dataAsHalf = reinterpret_cast<__half*>(&data);
 			#pragma unroll
 			for (int j = 0; j < kNumElemPerLoad; ++j) {
@@ -96,7 +96,7 @@ __global__ void gemmKernel(
 	 *   Each thread still wants a row segment, len-TN, for the outer product.
 	 *
 	 * We want to read rows from shmem so data is contiguous and can use vectorized loads.
-	 * For details about As vs Bs being transposed and about padding see "Design Note: Bank Conflcits" in README.md
+	 * For details about As vs Bs being transposed and about padding see "Design Note: Memory" in README.md
 	 */
 	// BM=BN=128 __halfs/row = 64 banks/row
 	// put 1 bank's worth of padding after every 64 elements, so for each of the 4 subops of the v4 load
