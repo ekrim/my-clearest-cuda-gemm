@@ -157,7 +157,7 @@ __global__ void gemmKernel(
 
 	#pragma unroll
 	for (int i = 0; i < TM; ++i) {
-	    __half alignas(16) row[TN];
+	    __half row[TN];
 	    #pragma unroll
 	    for (int j = 0; j < TN; ++j) {
 	        row[j] = __float2half(acc[i][j]);
@@ -165,4 +165,43 @@ __global__ void gemmKernel(
 		uint4 *dst = reinterpret_cast<uint4*>(&C[(rowGlobReg + i) * N + colGlobReg]);
 		*dst = *reinterpret_cast<const uint4*>(row);
 	}
+}
+
+int main()
+{
+	constexpr int M = 32 * BM;
+	constexpr int K = 24 * BK;
+	constexpr int N = 32 * BN;
+
+	__half *hA, *hB, *hC;
+	cudaMallocHost(&hA, M * K * sizeof(__half)); // pinned + aligned
+	cudaMallocHost(&hB, K * N * sizeof(__half));
+	cudaMallocHost(&hC, M * N * sizeof(__half));
+
+	__half *dA, *dB, *dC;
+	cudaMalloc(&dA, M * K * sizeof(__half));
+	cudaMalloc(&dB, K * N * sizeof(__half));
+	cudaMalloc(&dC, M * N * sizeof(__half));
+
+	cudaMemcpy(dA, hA, M * K * sizeof(__half), cudaMemcpyHostToDevice);
+	cudaMemcpy(dB, hB, K * N * sizeof(__half), cudaMemcpyHostToDevice);
+
+	// launch
+	dim3 block(16, 16, 1); // 256 threads per block
+	dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, 1);
+	gemmKernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+	cudaDeviceSynchronize();
+
+	// copy C to host
+	cudaMemcpy(hC.data(), dC, M * N * sizeof(__half), cudaMemcpyDeviceToHost);
+
+	cudaFree(dA);
+	cudaFree(dB);
+	cudaFree(dC);
+
+	cudaFreeHost(hA);
+	cudaFreeHost(hB);
+	cudaFreeHost(hC);
+
+	return 0;
 }

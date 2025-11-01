@@ -56,8 +56,11 @@ With `Asmem` transposed, then both `Asmem` and `Bsmem` are `64x128` with sequent
 
 By adding padding equal to one bank after each 64 elements (adding 2 cols in the middle and 2 cols at the end of the matrices), the banks stagger such that now there is no conflict within the subop. In the bottom plot, the banks of the 1st subop for all threads are highlighted again, showing no conflict.
 
+### Install and Profile
 
+```
+nvcc -O3 -o gemm kernel.cu
+ncu --set full --kernel-name gemmKernel ./gemm
 
-
-
+```
 
