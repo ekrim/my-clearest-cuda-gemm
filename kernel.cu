@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 // thread block tiles of input matrices
 constexpr int BM = 128;
@@ -41,7 +42,7 @@ __device__ __forceinline__ void loadGlobalToShared(
 	    if constexpr (kIsTransposed) {
 			// non-vectorized store since we're storing contiguous chunk as column in shmem
 			// See "Design Note: Memory" in README.md
-			__half* dataAsHalf = reinterpret_cast<__half*>(&data);
+			const __half* dataAsHalf = reinterpret_cast<const __half*>(&data);
 			#pragma unroll
 			for (int j = 0; j < kNumElemPerLoad; ++j) {
 			    Xs[colInTile + j][addPaddingToCol(rowInTile)] = dataAsHalf[j];
@@ -60,7 +61,7 @@ __device__ __forceinline__ void loadSharedToRegisters(const __half *__restrict__
     const uint4 data = *reinterpret_cast<const uint4*>(&Xs[idxInTile]);
 
     // reinterpret as 8 halfs
-    const __half* dataAsHalf = reinterpret_cast<__half*>(&data);
+    const __half* dataAsHalf = reinterpret_cast<const __half*>(&data);
 
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -126,16 +127,16 @@ __global__ void gemmKernel(
             // this block computes BMxBN output, but since we already loaded As[BK][BM] and Bs[BK][BN],
             // we just need tile-relative indices. For register-tile at [r][c] (relative to block-tile), we
             // take As[kdimInTile][r:r+TM] and Bs[kdimInTile][c:c+TN]
-            float Areg[TM];
+            __half Areg[TM];
 			const int rowInTileOfReg = threadIdx.y * TM;
 			// Asmem is transposed, so to take a len-TM row segment, this thread's row acts like the col in the index calc below
 			const int idxInTileAs = (kdimInTile * kColsAs) + addPaddingToCol(rowInTileOfReg);
-			loadSharedToRegisters<TM>(As, Areg, idxInTileAs);
+			loadSharedToRegisters<TM>(&As[0][0], Areg, idxInTileAs);
 
-            float Breg[TN];
+            __half Breg[TN];
 			const int colInTileOfReg = threadIdx.x * TN;
 			const int idxInTileBs = (kdimInTile * kColsBs) + addPaddingToCol(colInTileOfReg);
-			loadSharedToRegisters<TN>(Bs, Breg, idxInTileBs);
+			loadSharedToRegisters<TN>(&Bs[0][0], Breg, idxInTileBs);
 
 			// Step 5: Compute outer product
             // FMA into 8x8 fp32 accumulators
@@ -143,7 +144,7 @@ __global__ void gemmKernel(
             for (int i = 0; i < TM; ++i) {
                 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
-					acc[i][j] += Areg[i] * Breg[j]; // accumulate outer product for this BK-tile
+					acc[i][j] += __half2float(Areg[i]) * __half2float(Breg[j]); // accumulate outer product for this BK-tile
 		        }
             }
         }
@@ -193,7 +194,7 @@ int main()
 	cudaDeviceSynchronize();
 
 	// copy C to host
-	cudaMemcpy(hC.data(), dC, M * N * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(hC, dC, M * N * sizeof(__half), cudaMemcpyDeviceToHost);
 
 	cudaFree(dA);
 	cudaFree(dB);
