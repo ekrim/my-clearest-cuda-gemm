@@ -39,18 +39,21 @@ __device__ __forceinline__ void loadGlobalToShared(
 	    const uint4 data = *reinterpret_cast<const uint4*>(&X[idxGlob]); // 16B read to register
 
 	    // store to shmem, transpose if needed
-	    constexpr bool kIsTransposed = RowsSmem != RowsInputTile; // no padded rows, so we can use this check
-	    if constexpr (kIsTransposed) {
-			// non-vectorized store since we're storing contiguous chunk as column in shmem
-			// See "Design Note: Memory" in README.md
-			const __half* dataAsHalf = reinterpret_cast<const __half*>(&data);
-			#pragma unroll
-			for (int j = 0; j < kNumElemPerLoad; ++j) {
-			    Xs[colInTile + j][addPaddingToCol(rowInTile)] = dataAsHalf[j];
-			}
-	    } else {
-	    	// vectorized store if we're taking 16B contiguous from global and putting them contiguously into shmem
-		    *reinterpret_cast<uint4*>(&Xs[rowInTile][addPaddingToCol(colInTile)]) = data;
+		// See "Design Note: Memory" in README.md
+	    constexpr int kNumStoreOps = sizeof(uint4) / sizeof(__half2);
+	    const __half2 *pairs = reinterpret_cast<const __half2*>(&data);
+	    #pragma unroll
+	    for (int j = 0; j < kNumStoreOps; ++j) {
+	    	const __half2 h2 = pairs[j];
+		    constexpr bool kIsTransposed = RowsSmem != RowsInputTile; // no padded rows, so we can use this check
+		    if constexpr (kIsTransposed) {
+		    	const int colIdxWithPadding = addPaddingToCol(rowInTile);
+			    Xs[colInTile + j * 2][colIdxWithPadding] = __low2half(h2);
+			    Xs[colInTile + j * 2 + 1][colIdxWithPadding] = __high2half(h2);
+		    } else {
+		    	Xs[rowInTile][addPaddingToCol(colInTile + j * 2)] = __low2half(h2);
+		    	Xs[rowInTile][addPaddingToCol(colInTile + j * 2 + 1)] = __high2half(h2);
+		    }
 	    }
 	}
 }
@@ -58,15 +61,9 @@ __device__ __forceinline__ void loadGlobalToShared(
 template <int NumReg>
 __device__ __forceinline__ void loadSharedToRegisters(const __half *__restrict__ Xs, __half (&reg)[NumReg], int idxInTile)
 {
-	// vectorized load from shmem
-    const uint4 data = *reinterpret_cast<const uint4*>(&Xs[idxInTile]);
-
-    // reinterpret as 8 halfs
-    const __half* dataAsHalf = reinterpret_cast<const __half*>(&data);
-
     #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        reg[i] = dataAsHalf[i];
+    for (int i = 0; i < NumReg; ++i) {
+        reg[i] = Xs[idxInTile + i];
     }
 }
 
@@ -105,8 +102,8 @@ __global__ void gemmKernel(
 	// every thread in the warp is using a different bank
 	 constexpr int kColsAs = BM + 2 * kOneBankPadding;
 	 constexpr int kColsBs = BN + 2 * kOneBankPadding;
-	__shared__ alignas(16) __half As[BK][kColsAs];
-	__shared__ alignas(16) __half Bs[BK][kColsBs];
+	__shared__ __half As[BK][kColsAs];
+	__shared__ __half Bs[BK][kColsBs];
 
 	// row and column (upper left origin) of this block in output mat
 	const int rowGlobBlock = blockIdx.y * BM;
