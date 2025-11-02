@@ -59,7 +59,7 @@ By adding padding equal to one bank after each 64 elements (adding 2 cols in the
 ### Install and Profile
 
 ```
-nvcc -O3 -o gemm kernel.cu
+nvcc -o gemm kernel.cu -arch=sm_89
 ncu --set full --kernel-name gemmKernel ./gemm
 
 ```

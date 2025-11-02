@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdio>
 
 // thread block tiles of input matrices
 constexpr int BM = 128;
@@ -158,21 +159,24 @@ __global__ void gemmKernel(
 
 	#pragma unroll
 	for (int i = 0; i < TM; ++i) {
-	    __half row[TN];
+	    uint4 row;
+	    __half* rowAsHalf = reinterpret_cast<__half*>(&row);
 	    #pragma unroll
 	    for (int j = 0; j < TN; ++j) {
-	        row[j] = __float2half(acc[i][j]);
+	        rowAsHalf[j] = __float2half(acc[i][j]);
 	    }
 		uint4 *dst = reinterpret_cast<uint4*>(&C[(rowGlobReg + i) * N + colGlobReg]);
-		*dst = *reinterpret_cast<const uint4*>(row);
+		*dst = row;
 	}
 }
 
 int main()
 {
+	printf("Starting GEMM...\n");
 	constexpr int M = 32 * BM;
 	constexpr int K = 24 * BK;
 	constexpr int N = 32 * BN;
+	printf("Matrix sizes: M=%d, K=%d, N=%d\n", M, K, N);
 
 	__half *hA, *hB, *hC;
 	cudaMallocHost(&hA, M * K * sizeof(__half)); // pinned + aligned
@@ -190,8 +194,21 @@ int main()
 	// launch
 	dim3 block(16, 16, 1); // 256 threads per block
 	dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, 1);
+	printf("Launching with grid(%d, %d, %d) block(%d, %d, %d)\n",
+	       grid.x, grid.y, grid.z, block.x, block.y, block.z);
 	gemmKernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+		return 1;
+	}
 	cudaDeviceSynchronize();
+	err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		printf("Kernel execution error: %s\n", cudaGetErrorString(err));
+		return 1;
+	}
+	printf("Kernel completed successfully\n");
 
 	// copy C to host
 	cudaMemcpy(hC, dC, M * N * sizeof(__half), cudaMemcpyDeviceToHost);
