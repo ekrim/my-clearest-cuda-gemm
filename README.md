@@ -64,12 +64,8 @@ ncu --set full --kernel-name gemmKernel ./gemm
 
 ```
 
-I need to enable profiling on my VastAI instance to get Global/Shared sections, but NSight Compute at least gives this summary, and a pointer that we have some shared memory bank conflicts.
+I need to enable profiling on my VastAI instance to get Global/Shared sections, but Nsight Compute at least gives this summary, and a pointer that we have some shared memory bank conflicts.
 
-![avoiding bank conflicts with padding](assets/bank_conflicts.png)
+![memory analysis with Nsight Compute](assets/NsightCompute.png)
 
 This is happening when we load to `Asmem`, since it's transposed, and our padding repeats after 16 rows (this is good enough when we're doing row accesses, since the threads in a warp would only take two rows of shared, so this just affects the store to the transposed `Asmem`).
-
-
-
-![avoiding bank conflicts with padding](assets/bank_conflicts.png)
